@@ -1,12 +1,11 @@
 import express from "express";
+import ffmpegPath from "ffmpeg-static";
+import { spawn } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { execFile } from "child_process";
 
 const app = express();
-
-// JSON body okuyabilsin diye ŞART:
 app.use(express.json({ limit: "200mb" }));
 
 app.get("/", (req, res) => res.send("ok"));
@@ -14,57 +13,50 @@ app.get("/", (req, res) => res.send("ok"));
 app.post("/merge-base64", async (req, res) => {
   try {
     const files = req.body?.files;
-    if (!Array.isArray(files) || files.length === 0) {
-      return res.status(400).json({ error: "files[] missing" });
+    if (!Array.isArray(files) || files.length < 1) {
+      return res.status(400).json({ error: "files array gerekli" });
     }
 
+    // temp klasör
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "merge-"));
     const listPath = path.join(dir, "list.txt");
+    const outPath = path.join(dir, "merged.mp3");
 
-    // dosyaları yaz
-    const writtenPaths = files.map((f, i) => {
-      const b64 = f?.b64;
-      if (!b64 || typeof b64 !== "string") {
-        throw new Error(`files[${i}].b64 missing`);
-      }
-      const buf = Buffer.from(b64, "base64");
-      const p = path.join(dir, `part-${String(i).padStart(3, "0")}.mp3`);
-      fs.writeFileSync(p, buf);
+    // base64 mp3'leri diske yaz
+    const filePaths = files.map((f, i) => {
+      const name = f.name || `part-${i + 1}.mp3`;
+      const p = path.join(dir, name);
+      fs.writeFileSync(p, Buffer.from(f.b64, "base64"));
       return p;
     });
 
-    // ffmpeg concat list
-    const listContent = writtenPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
+    // concat listesi (ffmpeg concat demuxer)
+    const listContent = filePaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
     fs.writeFileSync(listPath, listContent);
 
-    const outPath = path.join(dir, "merged.mp3");
-
-    // Re-encode ile en stabil merge:
-    const args = [
+    // ffmpeg çalıştır
+    const ff = spawn(ffmpegPath, [
       "-f", "concat",
       "-safe", "0",
       "-i", listPath,
-      "-c:a", "libmp3lame",
-      "-q:a", "2",
+      "-c", "copy",
       outPath
-    ];
+    ]);
 
-    await new Promise((resolve, reject) => {
-      execFile("ffmpeg", args, (err, stdout, stderr) => {
-        if (err) return reject(new Error(stderr || err.message));
-        resolve();
-      });
+    let err = "";
+    ff.stderr.on("data", d => (err += d.toString()));
+
+    ff.on("close", (code) => {
+      if (code !== 0) {
+        return res.status(500).json({ error: "ffmpeg failed", detail: err.slice(-2000) });
+      }
+      const buf = fs.readFileSync(outPath);
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Content-Disposition", "attachment; filename=merged.mp3");
+      return res.send(buf);
     });
-
-    const outBuf = fs.readFileSync(outPath);
-    const outB64 = outBuf.toString("base64");
-
-    // cleanup (best-effort)
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-
-    return res.json({ filename: "merged.mp3", b64: outB64 });
   } catch (e) {
-    return res.status(500).json({ error: e.message || String(e) });
+    return res.status(500).json({ error: e.message });
   }
 });
 
